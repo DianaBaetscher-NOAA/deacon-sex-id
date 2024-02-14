@@ -1,0 +1,212 @@
+---
+title: "deacon-sex-id"
+author: "diana baetscher"
+date: "2024-02-14"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Walkthrough for unknown samples:
+
+Using the rds file output from microhaplot:
+1. read in rds files
+2. apply read depth filters
+3. apply allele balance filter
+
+
+```{r install-packages-and-load-functions}
+library(tidyverse)
+library(readxl)
+library(stringr)
+library(lubridate)
+library(rubias)
+library(ggpattern)
+
+
+source("../R/rockfish-funcs2.R")
+
+
+#### Call genos from the microhaplot rds files ####
+
+# the directory with the rds file
+dir <- "../data/rds_files/"
+
+
+# cycle over them, read them and add the gtseq_run column on each.
+# at the end, bind them together.
+genos_long <- call_genos_from_haplotRDS(path = file.path(dir, "deacon_sex_id.rds"))
+
+#### In the end, let us get a data frame that includes genotypes for all the individuals  ####
+# and which explicitly has NAs in places where data are missing
+genos_long_explicit_NAs <- genos_long %>%
+  select(id) %>%
+  unique() %>%
+  unlist() %>%
+  unname() %>%
+  expand.grid(id = ., locus = unique(genos_long$locus), gene_copy = 1:2, stringsAsFactors = FALSE) %>%
+  tbl_df() %>% 
+  left_join(., genos_long) %>%
+  arrange(id, locus, gene_copy) %>%
+    mutate(id = str_replace(id, "s", ""))
+
+  
+```
+
+
+```{r check-genos-and-data}
+# alleles have Ns because I didn't trim the reference
+genos_long_explicit_NAs %>%
+  ggplot(aes(x = locus, y = id, fill = depth)) +
+  geom_tile()
+
+```
+One individual didn't genotype.
+
+```{r add-metadata}
+# samplesheet
+ss <- read_csv("../data/20240212_OgoGT1_deaconSexID.csv", skip = 19) %>%
+  mutate(s_id = row_number()) %>%
+   mutate(Sample_ID = str_replace(Sample_ID, "ABLG", ""))
+
+ss$s_id <- as.character(ss$s_id)
+
+# ABLG numbers
+meta <- read_xlsx("../data/deacons_to_gtseq.xlsx")
+meta$ABLG <- as.character(meta$ABLG)
+
+sex <- meta %>%
+  select(ABLG, Sex)
+
+# add sex info to the samplesheet
+deacon_sex_genos <- ss %>%
+  select(Sample_ID, s_id) %>%
+  left_join(., sex, by = c("Sample_ID" = "ABLG")) %>%
+  inner_join(., genos_long_explicit_NAs, by = c("s_id" = "id"))
+
+```
+
+
+
+```{r prep-for-pca}
+# first make integers of the alleles
+alle_idxs <- deacon_sex_genos %>% 
+  filter(s_id != 141) %>% # missing all four loci
+  dplyr::select(Sample_ID, locus, gene_copy, allele, Sex) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(Sample_ID, locus, alleidx) # rubias can handle NA's, so no need to change them to 0's
+
+  
+# and spread the alleles
+two_col <- alle_idxs %>%
+  #group_by(indiv, locus) %>%
+  unite(loc, locus, gene_copy, sep = ".") %>%
+  #ungroup() %>%
+  select(-allele) %>%
+  pivot_wider(names_from = loc, values_from = alleidx) 
+
+
+```
+
+## Make a PCA to separate female/males
+
+
+```{r pca}
+library(DescTools)
+
+samples_for_pca <- alle_idxs %>%
+  rename(INDIVIDUALS = Sample_ID, STRATA = Sex, MARKERS = locus, GT = alleidx) %>%
+  filter(!str_detect(INDIVIDUALS, "NTC")) # Remove NTCs at this point because they are missing nearly all markers.
+  
+
+samples_for_pca
+
+# reformat genotypes for genind conversion
+# create 3 digit integers from the genotypes
+samples_for_pca$GT3 <- DescTools::Format(samples_for_pca$GT, ldigits = 3, digits = 0)
+      
+# fix NAs
+long_df0s <- samples_for_pca %>%
+  mutate(GT3 = ifelse(is.na(GT3), "000", GT3))
+      
+# Now combine the GT3 column per indiv/marker:
+# make the genos characters and then try pasting them as strings
+long_df0s$GT3 <- as.character(long_df0s$GT3)
+      
+long_df3digit <- long_df0s %>%
+  group_by(INDIVIDUALS, MARKERS) %>% 
+  arrange(GT3, .by_group = TRUE) %>% 
+  summarise(GENOTYPE = toString(GT3)) %>%
+  ungroup()
+      
+# paste strings together
+long_df3digit$GENOTYPE <- gsub(", ","",long_df3digit$GENOTYPE)
+      
+# add back on species identity as strata
+df_for_conversion <- long_df0s %>% 
+  select(-GT, -GT3, -MARKERS) %>%
+  unique() %>%
+  left_join(., long_df3digit) %>%
+  rename(GT = GENOTYPE) %>%
+  mutate(GT = ifelse(GT == "000000", NA, GT))
+      
+df_for_conversion$STRATA <- as.factor(df_for_conversion$STRATA)
+      
+# use the radiator package for this conversion
+library(radiator)
+
+pop_genind_df <- radiator::write_genind(df_for_conversion)
+   
+# Now that the data is a genind object, we can do all sorts of things using the adegenet package.
+# Allele presence absence data are extracted and NAs replaced using tab:
+library(adegenet)
+
+pop_dataset <- adegenet::tab(pop_genind_df) # double check that is this the appropriate method: options are "as is", "mean", or "zero"
+# frequency - should the data be transformed to relative frequencies
+      
+# PCA
+dataset_pop1 <- dudi.pca(pop_dataset, nf = 6, scannf = F, center = T) # I lowered this based on the screeplot
+
+pop_pca_df <- rownames_to_column(dataset_pop1$li, var = "indiv")
+
+as_tibble(pop_genind_df@strata) %>%
+  left_join(., pop_pca_df, by = c("INDIVIDUALS" = "indiv")) %>%
+  ggplot(aes(x = Axis1, y = Axis2, label = INDIVIDUALS)) +
+  geom_jitter(width = 0.5, height = 0.5, size = 3, alpha = 0.5) +
+  geom_text(nudge_x = 0.5, nudge_y = 0.5, size = 4) +
+  theme_bw() +
+  labs(title = "deacon - sex id markers",
+       x = "PC1",
+       y = "PC2")
+
+```
+
+```{r check-those-sex-ids}
+as_tibble(pop_genind_df@strata) %>%
+  left_join(., pop_pca_df, by = c("INDIVIDUALS" = "indiv")) %>%
+  filter(INDIVIDUALS != "10628") %>% # remove the outlier
+   ggplot(aes(x = Axis1, y = Axis2, label = STRATA)) +
+  geom_jitter(width = 0.5, height = 0.5, size = 3, alpha = 0.5) +
+  geom_text(nudge_x = 0.5, nudge_y = 0.5, size = 4) +
+  theme_bw() +
+  labs(title = "deacon - sex id markers",
+       x = "PC1",
+       y = "PC2")
+  
+```
+
+That looks decent. What are the unknowns?
+```{r unknown-sex}
+as_tibble(pop_genind_df@strata) %>%
+  left_join(., pop_pca_df, by = c("INDIVIDUALS" = "indiv")) %>%
+  filter(is.na(STRATA))
+
+```
+
+Based on PC1, the first two are female and the third is male.
+
+ABLG numbers 34228 and 34229 are female and 34230 is male.
